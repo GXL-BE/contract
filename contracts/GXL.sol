@@ -11,6 +11,7 @@ contract GXL is AccessControl, Pausable {
     using ECDSA for bytes32;
 
     bytes32 public constant OWNER_ROLE = keccak256("OWNER_ROLE");
+    bytes32 public constant OPERATION_ROLE = keccak256("OPERATION_ROLE");
     bytes32 public constant SIGNER_ROLE = keccak256("SIGNER_ROLE");
 
     uint public chainId;
@@ -18,14 +19,20 @@ contract GXL is AccessControl, Pausable {
     mapping(string => uint) private isWithdrawn;
     mapping(address => bool) public supportedAssets;
 
+    address public POOL_STORE_ADDRESS;
 
     event LogDeposit(address user, address asset, uint amount, uint timestamp);
+    event LogWithdrawWithPermit(string itx, address user, address asset, uint amount, uint timestamp);
     event LogWithdraw(string itx, address user, address asset, uint amount, uint timestamp);
+    event LogWithdrawRevenue(address[] assets, uint[] amounts);
+    event LogSetPoolStoreAddress(address poolStore);
 
     constructor() {
         uint _chainId;
         assembly {_chainId := chainid()}
         chainId = _chainId;
+
+        _setRoleAdmin(OPERATION_ROLE, OWNER_ROLE);
         _setRoleAdmin(SIGNER_ROLE, OWNER_ROLE);
         _setRoleAdmin(OWNER_ROLE, OWNER_ROLE);
         _setupRole(OWNER_ROLE, msg.sender);
@@ -36,25 +43,38 @@ contract GXL is AccessControl, Pausable {
         _;
     }
 
-    function deposit(address asset, uint amount)
-    supportedAsset(asset)
-    external {
-        require(amount > 0, "invalid amount");
-        bool transferred = IERC20(asset).transferFrom(msg.sender, address(this), amount);
-        require(transferred, "cannot transfer");
-
-        emit LogDeposit(msg.sender, asset, amount, block.timestamp);
+    modifier validItx(string calldata itx) {
+        require(isWithdrawn[itx] == 0, "withdrawn");
+        isWithdrawn[itx] = block.number;
+        _;
     }
 
-    function withdraw(string calldata itx,
+    function getWithdrawnStatus(string calldata itx) external view returns (uint) {
+        return isWithdrawn[itx];
+    }
+
+    function deposit(address asset, uint amount)
+    supportedAsset(asset)
+    payable
+    external {
+        uint _amount = asset == address(0) ? msg.value : amount;
+        require(_amount > 0, "invalid amount");
+        if (asset != address(0)) {
+            bool transferred = IERC20(asset).transferFrom(msg.sender, address(this), _amount);
+            require(transferred, "cannot transfer");
+        }
+        emit LogDeposit(msg.sender, asset, _amount, block.timestamp);
+    }
+
+    function withdrawWithPermit(string calldata itx,
         address user,
         address asset,
         uint amount,
         bytes calldata signature)
     whenNotPaused
+    validItx(itx)
     supportedAsset(asset)
     external {
-        require(isWithdrawn[itx] == 0, "withdrawn");
         bytes32 hash = keccak256(abi.encodePacked(
                 chainId,
                 user,
@@ -64,10 +84,46 @@ contract GXL is AccessControl, Pausable {
                 address(this)
             ));
         require(verifySignature(hash, signature), "invalid signature");
-        isWithdrawn[itx] = block.number;
-        bool transferred = IERC20(asset).transfer(user, amount);
-        require(transferred, "cannot transfer");
+        _withdraw(asset, user, amount);
+        emit LogWithdrawWithPermit(itx, user, asset, amount, block.timestamp);
+    }
+
+    function withdraw(string calldata itx, address asset, address user, uint amount)
+    external
+    whenNotPaused
+    validItx(itx)
+    onlyRole(OPERATION_ROLE) {
+        _withdraw(asset, user, amount);
         emit LogWithdraw(itx, user, asset, amount, block.timestamp);
+    }
+
+    function withdrawRevenue(address[] calldata assets, uint[] calldata amounts) external
+    onlyRole(OPERATION_ROLE) {
+        uint length = assets.length;
+        require(length > 0, "invalid asset");
+        require(assets.length == amounts.length, "miss match length");
+        require(POOL_STORE_ADDRESS != address(0), "must be config pool store");
+        for (uint i; i < length; ++i) {
+            _withdraw(POOL_STORE_ADDRESS, assets[i], amounts[i]);
+        }
+        emit LogWithdrawRevenue(assets, amounts);
+    }
+
+    function setPoolStoreAddress(address pool) external onlyRole(OWNER_ROLE) {
+        POOL_STORE_ADDRESS = pool;
+        emit LogSetPoolStoreAddress(pool);
+    }
+
+    function _withdraw(address asset, address user, uint amount) internal {
+        require(amount > 0, "invalid amount");
+        if (asset == address(0)) {
+            address payable receiver = payable(user);
+            (bool sent,) = receiver.call{value : amount}("");
+            require(sent, "cannot withdraw native");
+        } else {
+            bool transferred = IERC20(asset).transfer(user, amount);
+            require(transferred, "cannot transfer");
+        }
     }
 
     function verifySignature(bytes32 hash, bytes calldata signature)
